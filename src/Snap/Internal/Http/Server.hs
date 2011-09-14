@@ -13,6 +13,7 @@ import           Blaze.ByteString.Builder.Char8
 import           Blaze.ByteString.Builder.Enumerator
 import           Blaze.ByteString.Builder.HTTP
 import           Control.Arrow (first, second)
+import           Control.Concurrent (takeMVar, newEmptyMVar, putMVar)
 import           Control.Monad.CatchIO hiding ( bracket
                                               , catches
                                               , finally
@@ -403,10 +404,14 @@ httpSession defaultTimeout writeEnd' buffer onSendFile tickle handler = do
 
           debug "Server.httpSession: handled, skipping request body"
 
-          if rspTransformingRqBody rsp
+          let isHttpEscape = case rspBody rsp of
+                                EscapeHttp _ -> True
+                                _            -> False
+
+          if rspTransformingRqBody rsp || isHttpEscape
              then debug $
                       "Server.httpSession: not skipping " ++
-                      "request body, transforming."
+                      "request body, transforming or escaping HTTP."
              else do
                srqEnum <- liftIO $ readIORef $ rqBody req'
                let (SomeEnumerator rqEnum) = srqEnum
@@ -434,11 +439,40 @@ httpSession defaultTimeout writeEnd' buffer onSendFile tickle handler = do
                 (\_ -> logAccess req $ setContentLength bytesSent rsp')
                 (rspContentLength rsp')
 
-          if cc
-             then do
+          case rspBody rsp of
+            (EscapeHttp escapeHttpHandler) -> do
+                 debug $ "Server.httpSession: giving control to " ++
+                         "user escapeHttpHandler"
+                 liftIO $ tickle defaultTimeout
+                 mvar <- liftIO newEmptyMVar 
+                 let 
+                     escWrite :: Iteratee Builder IO ()
+                     escWrite = mapIter toByteString 
+                                        fromByteString 
+                                        writeEnd
+                     escRead :: Enumerator ByteString IO a
+                     escRead = I.checkContinue0 (\loop k -> do
+                                         c <- liftIO (takeMVar mvar)
+                                         k c >>== loop)
+                 liftIO . forkIO $ escapeHttpHandler tickle 
+                                                     escRead 
+                                                     escWrite
+                 let loop = continue (\c -> do
+                                              liftIO $ putMVar mvar c
+                                              case c of
+                                                EOF      -> return ()
+                                                Chunks _ -> loop
+                                    )
+
+                 lift loop
+
+            _ | cc -> do
                  debug $ "httpSession: Connection: Close, harikari"
                  liftIO $ myThreadId >>= killThread
-             else httpSession defaultTimeout writeEnd' buffer onSendFile
+            _ | otherwise ->
+                -- no Connection: close or HTTP/1.0, 
+                -- and no HTTP escape.
+                httpSession defaultTimeout writeEnd' buffer onSendFile
                               tickle handler
 
       Nothing -> do
@@ -709,6 +743,8 @@ sendResponse req rsp' buffer writeEnd' onSendFile = do
 
     (!x,!bs) <-
         case (rspBody rsp) of
+          (EscapeHttp _)       -> lift $ whenEnum writeEnd headerString hlen
+                                                  rsp (enumBuilder mempty)
           (Enum e)             -> lift $ whenEnum writeEnd headerString hlen
                                                   rsp e
           (SendFile f Nothing) -> lift $
@@ -846,6 +882,7 @@ sendResponse req rsp' buffer writeEnd' onSendFile = do
                  (Enum _) -> joinI $ takeExactly (cl + fromIntegral hlen)
                                   $$ we
                  (SendFile _ _) -> we
+                 (EscapeHttp _) -> we
 
         mbCL = rspContentLength resp
 
@@ -896,6 +933,7 @@ sendResponse req rsp' buffer writeEnd' onSendFile = do
 
         r''' <- do
             z <- case rspBody r'' of
+                   (EscapeHttp _)            -> return r''
                    (Enum _)                  -> return r''
                    (SendFile f Nothing)      -> setFileSize f r''
                    (SendFile _ (Just (s,e))) -> return $
